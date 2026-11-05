@@ -40,6 +40,34 @@ create policy "officers update applications" on public.applications for update u
 create policy "application events visible to participants" on public.application_events for select using (exists (select 1 from public.applications a where a.id = application_id and (a.applicant_id = auth.uid() or exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'officer'))));
 create policy "participants create events" on public.application_events for insert with check (actor_id = auth.uid());
 
+insert into storage.buckets (id, name, public) values ('documents', 'documents', false)
+on conflict (id) do update set public = false;
+create policy "citizens upload own documents" on storage.objects for insert to authenticated
+with check (bucket_id = 'documents' and (storage.foldername(name))[1] = auth.uid()::text);
+create policy "participants read documents" on storage.objects for select to authenticated
+using (bucket_id = 'documents' and (
+  (storage.foldername(name))[1] = auth.uid()::text
+  or exists (select 1 from public.profiles p where p.id = auth.uid() and p.role = 'officer')
+));
+
+create or replace function public.officer_action(
+  p_application_id uuid, p_action text, p_note text default ''
+) returns public.applications language plpgsql security definer set search_path = public as $$
+declare result public.applications; next_status public.application_status; next_stage smallint;
+begin
+  if not exists (select 1 from profiles where id = auth.uid() and role = 'officer') then
+    raise exception 'Officer access required';
+  end if;
+  if p_action not in ('forward', 'approve', 'reject', 'pending') then raise exception 'Invalid action'; end if;
+  select * into result from applications where id = p_application_id for update;
+  if result.id is null then raise exception 'Application not found'; end if;
+  next_status := case p_action when 'approve' then 'A'::application_status when 'reject' then 'R'::application_status when 'pending' then 'P'::application_status else 'I'::application_status end;
+  next_stage := case p_action when 'approve' then 3 when 'reject' then result.stage when 'pending' then result.stage else least(result.stage + 1, 3) end;
+  update applications set status = next_status, stage = next_stage, updated_at = now() where id = p_application_id returning * into result;
+  insert into application_events(application_id, actor_id, stage, status, note) values (p_application_id, auth.uid(), next_stage, next_status, coalesce(p_note, ''));
+  return result;
+end; $$;
+
 insert into public.services (id,name,required_documents,required_fields,fee,processing_time) values
 ('pan','PAN Card','["Aadhaar Card","Passport size photo","Date of birth proof","Address proof"]','["Applicant Type","Area Code"]','₹107','15–20 days'),
 ('voter','Voter ID Card','["Aadhaar Card","Passport size photo","Age proof","Address proof"]','["Assembly Constituency","Relative Name"]','Free','30 days'),
